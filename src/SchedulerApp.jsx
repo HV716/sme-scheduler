@@ -498,6 +498,37 @@ export default function SchedulerApp() {
     return { total, filled: total - unfilled, unfilled, approvedCount };
   }, [engineOut, overrides, approved, sessions]);
 
+  // Export to Sheets: this is the read/write seam where a real Google Sheets
+  // API write-back would plug in (see write-up §2/§6). For the prototype it
+  // generates a CSV in the exact shape ops would paste into or import as a
+  // Google Sheet — same columns, same one-row-per-session structure — without
+  // needing OAuth credentials for a synthetic-data demo.
+  const csvField = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const exportToSheet = () => {
+    const header = ["Session ID", "Day", "Time", "Topic", "Mode", "Cohort", "Required Level", "Assigned SME", "Status", "Confidence %", "Approved"];
+    const rows = [...sessions]
+      .sort((a, b) => DAYS.indexOf(a.day) - DAYS.indexOf(b.day) || toMin(a.start) - toMin(b.start))
+      .map((s) => {
+        const smeId = finalAssignment(s.id);
+        const dropped = smeId === "__DROPPED__";
+        const sme = smeId && !dropped ? smeById(smeId) : null;
+        const eng = engineOut.assignments.find((a) => a.sessionId === s.id);
+        const confidence = overrides[s.id] === undefined ? eng?.confidence ?? "" : "";
+        const status = sme ? "Assigned" : dropped ? "Needs reassignment" : "Unfilled";
+        return [s.id, s.day, s.start, s.topic, s.mode, s.cohort, LEVEL_LABEL[s.level], sme?.name || "—", status, confidence, approved[s.id] ? "Yes" : "No"];
+      });
+    const csv = [header, ...rows].map((r) => r.map(csvField).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `sme-schedule-week-${sessions[0]?.day || "draft"}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <div style={{ ...ui, background: T.bg, color: T.text, minHeight: 640, borderRadius: 10, overflow: "hidden", border: `1px solid ${T.line}` }}>
       {/* Top bar */}
@@ -681,13 +712,16 @@ export default function SchedulerApp() {
                   );
                 })}
 
-                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
                   <button onClick={() => {
                     const all = {};
                     sessions.forEach((s) => { if (finalAssignment(s.id) && finalAssignment(s.id) !== "__DROPPED__") all[s.id] = true; });
                     setApproved(all);
                   }} style={{ ...mono, fontSize: 11.5, color: T.text, background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 6, padding: "7px 12px", cursor: "pointer" }}>
                     Approve all filled sessions
+                  </button>
+                  <button onClick={exportToSheet} style={{ ...mono, fontSize: 11.5, color: T.accent, background: "transparent", border: `1px solid ${T.accent}55`, borderRadius: 6, padding: "7px 12px", cursor: "pointer" }}>
+                    ⬇ Export to Sheets (.csv)
                   </button>
                   <button onClick={() => setPhase("submitted")} style={{ ...mono, fontSize: 11.5, fontWeight: 700, color: "#0E1013", background: T.green, border: "none", borderRadius: 6, padding: "7px 12px", cursor: "pointer" }}>
                     Submit approvals →
@@ -759,8 +793,13 @@ export default function SchedulerApp() {
           <div style={{ fontSize: 12.5, color: T.sub, marginBottom: 4 }}>
             {stats.approvedCount} of {stats.total} sessions approved · {stats.unfilled} still need ops follow-up.
           </div>
-          <div style={{ fontSize: 11.5, color: T.faint, ...mono, marginBottom: 20 }}>In production this write-back would push to the Google Sheet / Calendar via the FastAPI service.</div>
-          <button onClick={() => setPhase("draft")} style={{ ...mono, fontSize: 11.5, color: T.text, background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 6, padding: "7px 14px", cursor: "pointer" }}>← back to draft</button>
+          <div style={{ fontSize: 11.5, color: T.faint, ...mono, marginBottom: 20 }}>In production this write-back would push directly to the Google Sheet / Calendar via the FastAPI service — the CSV export below is that same read/write seam, standing in for a live Sheets API call in this synthetic-data prototype.</div>
+          <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
+            <button onClick={exportToSheet} style={{ ...mono, fontSize: 11.5, color: T.accent, background: "transparent", border: `1px solid ${T.accent}55`, borderRadius: 6, padding: "7px 14px", cursor: "pointer" }}>
+              ⬇ Export to Sheets (.csv)
+            </button>
+            <button onClick={() => setPhase("draft")} style={{ ...mono, fontSize: 11.5, color: T.text, background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 6, padding: "7px 14px", cursor: "pointer" }}>← back to draft</button>
+          </div>
         </div>
       )}
     </div>

@@ -1,4 +1,5 @@
 import { useState, useMemo, useCallback } from "react";
+import Papa from "papaparse";
 
 /* ============================================================
    DESIGN TOKENS — "Dispatch Console"
@@ -149,6 +150,139 @@ const toMin = (hhmm) => {
   return h * 60 + m;
 };
 const overlaps = (aStart, aEnd, bStart, bEnd) => aStart < bEnd && bStart < aEnd;
+
+/* ============================================================
+   INGEST LAYER
+   Real-world ops export sessions/SME data from a spreadsheet, so
+   CSV is the natural upload format — it mirrors what a Google
+   Sheets export would look like, and needs no special software to
+   author or edit. SME data has nested fields (skills, ratings,
+   availability windows), so those are pipe/comma-delimited within
+   a single cell, same trick many spreadsheet-to-CSV exports use for
+   repeating sub-fields. Template downloads exist so ops never has
+   to guess the format from scratch.
+   ============================================================ */
+const csvCell = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+const csvBuild = (rows) => rows.map((r) => r.map(csvCell).join(",")).join("\n");
+
+function downloadText(filename, text, mime = "text/csv;charset=utf-8;") {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function sessionsToCSV(sessions) {
+  const header = ["id", "topic", "day", "start", "duration", "mode", "level", "cohort"];
+  const rows = sessions.map((s) => [s.id, s.topic, s.day, s.start, s.dur, s.mode, LEVEL_LABEL[s.level], s.cohort]);
+  return csvBuild([header, ...rows]);
+}
+
+function smesToCSV(smes) {
+  const header = ["id", "name", "timezone", "maxPerWeek", "skills", "ratings", "availability", "history4", "prefers"];
+  const rows = smes.map((sme) => [
+    sme.id, sme.name, sme.tz, sme.maxPerWeek,
+    Object.entries(sme.skills).map(([t, l]) => `${t}:${LEVEL_LABEL[l]}`).join("|"),
+    Object.entries(sme.ratings).map(([t, r]) => `${t}:${r}`).join("|"),
+    sme.avail.map(([d, f, to]) => `${d}:${f}-${to}`).join("|"),
+    sme.history4.join(","),
+    sme.prefers.join("|"),
+  ]);
+  return csvBuild([header, ...rows]);
+}
+
+// Parses "Topic A:Expert|Topic B:Trained" into { "Topic A": 3, "Topic B": 2 }
+function parseSkillMap(cell) {
+  const out = {};
+  if (!cell) return out;
+  cell.split("|").forEach((pair) => {
+    const [topic, levelName] = pair.split(":").map((x) => x?.trim());
+    if (topic && levelName && LEVELS[levelName] !== undefined) out[topic] = LEVELS[levelName];
+  });
+  return out;
+}
+// Parses "Topic A:4.8|Topic B:4.2" into { "Topic A": 4.8, "Topic B": 4.2 }
+function parseRatingMap(cell) {
+  const out = {};
+  if (!cell) return out;
+  cell.split("|").forEach((pair) => {
+    const [topic, rating] = pair.split(":").map((x) => x?.trim());
+    if (topic && rating && !isNaN(Number(rating))) out[topic] = Number(rating);
+  });
+  return out;
+}
+// Parses "Mon:08:00-13:00|Wed:17:00-21:00" into [["Mon","08:00","13:00"], ...]
+function parseAvailability(cell) {
+  if (!cell) return [];
+  return cell.split("|").map((block) => {
+    const [day, range] = block.split(":").length > 2
+      ? [block.split(":")[0], block.split(":").slice(1).join(":")]
+      : block.split(":");
+    const [from, to] = (range || "").split("-").map((x) => x?.trim());
+    return [day?.trim(), from, to];
+  }).filter((b) => b[0] && b[1] && b[2]);
+}
+
+function parseSessionsCSV(text) {
+  const { data, errors } = Papa.parse(text.trim(), { header: true, skipEmptyLines: true });
+  if (errors.length) return { error: `CSV parse error: ${errors[0].message} (row ${errors[0].row})` };
+  const required = ["id", "topic", "day", "start", "duration", "mode", "level", "cohort"];
+  const missing = required.filter((c) => !(c in (data[0] || {})));
+  if (data.length === 0) return { error: "No rows found in the file." };
+  if (missing.length) return { error: `Missing required column(s): ${missing.join(", ")}` };
+
+  const sessions = [];
+  for (const [i, row] of data.entries()) {
+    if (!DAYS.includes(row.day)) return { error: `Row ${i + 2}: "${row.day}" is not a valid day (expected Mon–Fri).` };
+    if (!/^\d{2}:\d{2}$/.test(row.start)) return { error: `Row ${i + 2}: start time "${row.start}" should look like "09:00".` };
+    if (LEVELS[row.level] === undefined) return { error: `Row ${i + 2}: level "${row.level}" should be Associate, Trained, or Expert.` };
+    if (isNaN(Number(row.duration)) || Number(row.duration) <= 0) return { error: `Row ${i + 2}: duration "${row.duration}" should be a positive number of minutes.` };
+    sessions.push({
+      id: row.id || `S${i + 1}`, topic: row.topic, day: row.day, start: row.start,
+      dur: Number(row.duration), mode: row.mode, level: LEVELS[row.level], cohort: row.cohort,
+    });
+  }
+  return { sessions };
+}
+
+function parseSMEsCSV(text) {
+  const { data, errors } = Papa.parse(text.trim(), { header: true, skipEmptyLines: true });
+  if (errors.length) return { error: `CSV parse error: ${errors[0].message} (row ${errors[0].row})` };
+  const required = ["id", "name", "timezone", "maxPerWeek", "skills", "ratings", "availability", "history4", "prefers"];
+  const missing = required.filter((c) => !(c in (data[0] || {})));
+  if (data.length === 0) return { error: "No rows found in the file." };
+  if (missing.length) return { error: `Missing required column(s): ${missing.join(", ")}` };
+
+  const smes = [];
+  for (const [i, row] of data.entries()) {
+    const skills = parseSkillMap(row.skills);
+    if (Object.keys(skills).length === 0) return { error: `Row ${i + 2} (${row.name || row.id}): "skills" column has no valid "Topic:Level" pairs.` };
+    const history4raw = (row.history4 || "").split(",").map((x) => Number(x.trim()));
+    if (history4raw.length !== 4 || history4raw.some(isNaN)) return { error: `Row ${i + 2} (${row.name || row.id}): "history4" should be exactly 4 comma-separated numbers, e.g. "3,4,2,4".` };
+    if (isNaN(Number(row.maxPerWeek)) || Number(row.maxPerWeek) <= 0) return { error: `Row ${i + 2} (${row.name || row.id}): "maxPerWeek" should be a positive number.` };
+    smes.push({
+      id: row.id, name: row.name, tz: row.timezone || "IST",
+      skills, ratings: parseRatingMap(row.ratings), avail: parseAvailability(row.availability),
+      history4: history4raw, maxPerWeek: Number(row.maxPerWeek),
+      prefers: (row.prefers || "").split("|").map((x) => x.trim()).filter(Boolean),
+    });
+  }
+  return { smes };
+}
+
+function readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsText(file);
+  });
+}
 
 function isAvailable(sme, session) {
   const sStart = toMin(session.start);
@@ -390,8 +524,11 @@ function Badge({ children, tone = "sub" }) {
    MAIN APP
    ============================================================ */
 export default function SchedulerApp() {
-  const [sessions] = useState(seedSessions);
-  const [smes] = useState(seedSMEs);
+  const [sessions, setSessions] = useState(seedSessions);
+  const [smes, setSmes] = useState(seedSMEs);
+  const [dataSource, setDataSource] = useState({ sessions: "sample", smes: "sample" }); // "sample" | "uploaded"
+  const [ingestError, setIngestError] = useState(null);
+  const [showIngest, setShowIngest] = useState(false);
   const [phase, setPhase] = useState("idle"); // idle | matching | reasoning | draft | submitted
   const [engineOut, setEngineOut] = useState(null);
   const [aiOut, setAiOut] = useState(null);
@@ -456,6 +593,53 @@ export default function SchedulerApp() {
     setReanalyzing(true);
     await runReasoning(engineOut);
     setReanalyzing(false);
+  };
+
+  // Uploading new data invalidates any existing draft — ops should re-run
+  // matching against the freshly ingested week rather than see stale results.
+  const resetDraftState = () => {
+    setEngineOut(null);
+    setAiOut(null);
+    setOverrides({});
+    setApproved({});
+    setPhase("idle");
+    setDroppedNote(null);
+  };
+
+  const handleSessionsUpload = async (file) => {
+    setIngestError(null);
+    try {
+      const text = await readFileAsText(file);
+      const { sessions: parsed, error } = parseSessionsCSV(text);
+      if (error) return setIngestError(`Sessions file: ${error}`);
+      setSessions(parsed);
+      setDataSource((d) => ({ ...d, sessions: "uploaded" }));
+      resetDraftState();
+    } catch (e) {
+      setIngestError("Couldn't read that file. Make sure it's a .csv file exported from a spreadsheet.");
+    }
+  };
+
+  const handleSMEsUpload = async (file) => {
+    setIngestError(null);
+    try {
+      const text = await readFileAsText(file);
+      const { smes: parsed, error } = parseSMEsCSV(text);
+      if (error) return setIngestError(`SME pool file: ${error}`);
+      setSmes(parsed);
+      setDataSource((d) => ({ ...d, smes: "uploaded" }));
+      resetDraftState();
+    } catch (e) {
+      setIngestError("Couldn't read that file. Make sure it's a .csv file exported from a spreadsheet.");
+    }
+  };
+
+  const resetToSampleData = () => {
+    setSessions(seedSessions());
+    setSmes(seedSMEs());
+    setDataSource({ sessions: "sample", smes: "sample" });
+    setIngestError(null);
+    resetDraftState();
   };
 
   const smeById = (id) => smes.find((s) => s.id === id);
@@ -543,6 +727,12 @@ export default function SchedulerApp() {
               fill {stats.filled}/{stats.total} · approved {stats.approvedCount}/{stats.total}
             </span>
           )}
+          <button onClick={() => setShowIngest((v) => !v)} style={{
+            ...mono, fontSize: 11.5, color: showIngest ? "#0E1013" : T.text, background: showIngest ? T.accent : T.panel2,
+            border: `1px solid ${T.line}`, borderRadius: 6, padding: "8px 12px", cursor: "pointer",
+          }}>
+            📄 Data {dataSource.sessions === "uploaded" || dataSource.smes === "uploaded" ? "●" : ""}
+          </button>
           <button onClick={runAll} disabled={phase === "matching" || phase === "reasoning"} style={{
             ...mono, fontSize: 12, fontWeight: 600, color: "#0E1013", background: T.accent, border: "none",
             borderRadius: 6, padding: "8px 14px", cursor: "pointer", opacity: phase === "matching" || phase === "reasoning" ? 0.6 : 1,
@@ -551,6 +741,63 @@ export default function SchedulerApp() {
           </button>
         </div>
       </div>
+
+      {showIngest && (
+        <div style={{ padding: "14px 20px", borderBottom: `1px solid ${T.line}`, background: T.panel2 }}>
+          <div style={{ fontSize: 10.5, color: T.faint, ...mono, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 10 }}>
+            Ingest — upload this week's data (or keep the sample dataset below)
+          </div>
+          <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+            <div style={{ flex: "1 1 280px", background: T.panel, border: `1px solid ${T.line}`, borderRadius: 7, padding: 12 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                <span style={{ fontSize: 12.5, fontWeight: 600 }}>Sessions</span>
+                <Badge tone={dataSource.sessions === "uploaded" ? "green" : "sub"}>{dataSource.sessions === "uploaded" ? "uploaded" : "sample data"}</Badge>
+              </div>
+              <div style={{ fontSize: 11, color: T.sub, marginBottom: 8 }}>{sessions.length} sessions loaded</div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                <label style={{ ...mono, fontSize: 10.5, color: "#0E1013", background: T.accent, borderRadius: 5, padding: "5px 9px", cursor: "pointer" }}>
+                  Upload CSV
+                  <input type="file" accept=".csv" style={{ display: "none" }} onChange={(e) => e.target.files[0] && handleSessionsUpload(e.target.files[0])} />
+                </label>
+                <button onClick={() => downloadText("sessions-template.csv", sessionsToCSV(sessions))} style={{
+                  ...mono, fontSize: 10.5, color: T.text, background: "transparent", border: `1px solid ${T.line}`, borderRadius: 5, padding: "5px 9px", cursor: "pointer",
+                }}>Download template</button>
+              </div>
+            </div>
+            <div style={{ flex: "1 1 280px", background: T.panel, border: `1px solid ${T.line}`, borderRadius: 7, padding: 12 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                <span style={{ fontSize: 12.5, fontWeight: 600 }}>SME Pool</span>
+                <Badge tone={dataSource.smes === "uploaded" ? "green" : "sub"}>{dataSource.smes === "uploaded" ? "uploaded" : "sample data"}</Badge>
+              </div>
+              <div style={{ fontSize: 11, color: T.sub, marginBottom: 8 }}>{smes.length} SMEs loaded</div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                <label style={{ ...mono, fontSize: 10.5, color: "#0E1013", background: T.accent, borderRadius: 5, padding: "5px 9px", cursor: "pointer" }}>
+                  Upload CSV
+                  <input type="file" accept=".csv" style={{ display: "none" }} onChange={(e) => e.target.files[0] && handleSMEsUpload(e.target.files[0])} />
+                </label>
+                <button onClick={() => downloadText("sme-pool-template.csv", smesToCSV(smes))} style={{
+                  ...mono, fontSize: 10.5, color: T.text, background: "transparent", border: `1px solid ${T.line}`, borderRadius: 5, padding: "5px 9px", cursor: "pointer",
+                }}>Download template</button>
+              </div>
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 10 }}>
+            <div style={{ fontSize: 10.5, color: T.faint, lineHeight: 1.5, maxWidth: 560 }}>
+              SME columns encode nested fields as <code>Topic:Level</code> or <code>Day:start-end</code> pairs separated by <code>|</code> — download a template to see a filled example before editing.
+            </div>
+            {(dataSource.sessions === "uploaded" || dataSource.smes === "uploaded") && (
+              <button onClick={resetToSampleData} style={{ ...mono, fontSize: 10.5, color: T.amber, background: "transparent", border: `1px solid ${T.amber}55`, borderRadius: 5, padding: "5px 9px", cursor: "pointer", whiteSpace: "nowrap" }}>
+                ↺ Reset to sample data
+              </button>
+            )}
+          </div>
+          {ingestError && (
+            <div style={{ marginTop: 10, padding: "8px 10px", background: `${T.red}15`, border: `1px solid ${T.red}45`, borderRadius: 6, fontSize: 11.5, color: T.text }}>
+              ⚠ {ingestError}
+            </div>
+          )}
+        </div>
+      )}
 
       {phase === "draft" && engineOut && (
         <div style={{ display: "flex", alignItems: "center", gap: 18, padding: "9px 20px", borderBottom: `1px solid ${T.line}`, background: T.panel2, flexWrap: "wrap" }}>

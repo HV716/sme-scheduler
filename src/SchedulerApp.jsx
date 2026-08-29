@@ -521,7 +521,7 @@ export default function SchedulerApp() {
         </div>
       </div>
 
-      {engineOut && phase !== "matching" && phase !== "reasoning" && (
+      {phase === "draft" && engineOut && (
         <div style={{ display: "flex", alignItems: "center", gap: 18, padding: "9px 20px", borderBottom: `1px solid ${T.line}`, background: T.panel2, flexWrap: "wrap" }}>
           <span style={{ fontSize: 10.5, color: T.faint, ...mono, textTransform: "uppercase", letterSpacing: 0.6 }}>What-if weights</span>
           {[
@@ -565,7 +565,7 @@ export default function SchedulerApp() {
         </div>
       )}
 
-      {phase !== "idle" && phase !== "matching" && phase !== "reasoning" && engineOut && (
+      {phase === "draft" && engineOut && (
         <div style={{ display: "flex" }}>
           {/* Main panel */}
           <div style={{ flex: 1, borderRight: `1px solid ${T.line}` }}>

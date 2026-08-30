@@ -267,8 +267,8 @@ function parseSMEsCSV(text) {
     const skills = parseSkillMap(row.skills);
     if (Object.keys(skills).length === 0) return { error: `Row ${i + 2} (${row.name || row.id}): "skills" column has no valid "Topic:Level" pairs.` };
     const history4raw = (row.history4 || "").split(",").map((x) => Number(x.trim()));
-    if (history4raw.length !== 4 || history4raw.some(isNaN)) return { error: `Row ${i + 2} (${row.name || row.id}): "history4" should be exactly 4 comma-separated numbers, oldest to most recent week, e.g. "3,4,2,4" means 4 weeks ago=3, 3 weeks ago=4, 2 weeks ago=2, last week=4.` };
-    if (isNaN(Number(row.maxPerWeek)) || Number(row.maxPerWeek) <= 0) return { error: `Row ${i + 2} (${row.name || row.id}): "maxPerWeek" should be a positive number.` };
+    if (history4raw.length !== 4 || history4raw.some(isNaN) || history4raw.some((n) => n < 0)) return { error: `Row ${i + 2} (${row.name || row.id}): "history4" should be exactly 4 comma-separated non-negative numbers, oldest to most recent week, e.g. "3,4,2,4" means 4 weeks ago=3, 3 weeks ago=4, 2 weeks ago=2, last week=4.` };
+    if (isNaN(Number(row.maxPerWeek)) || Number(row.maxPerWeek) <= 0 || !Number.isInteger(Number(row.maxPerWeek))) return { error: `Row ${i + 2} (${row.name || row.id}): "maxPerWeek" should be a positive whole number (e.g. 4, not 2.5).` };
     smes.push({
       id: row.id, name: row.name, tz,
       skills, ratings: parseRatingMap(row.ratings), avail: parseAvailability(row.availability),
@@ -617,6 +617,8 @@ export default function SchedulerApp() {
   const [smes, setSmes] = useState(seedSMEs);
   const [dataSource, setDataSource] = useState({ sessions: "sample", smes: "sample" }); // "sample" | "uploaded"
   const [ingestError, setIngestError] = useState(null);
+  const [calendarStatus, setCalendarStatus] = useState("idle"); // idle | blocking | done
+  const [calendarResults, setCalendarResults] = useState(null);
   const [showIngest, setShowIngest] = useState(false);
   const [phase, setPhase] = useState("idle"); // idle | matching | reasoning | draft | submitted
   const [engineOut, setEngineOut] = useState(null);
@@ -862,6 +864,64 @@ export default function SchedulerApp() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  };
+
+  // Calendar integration: this app's fixed demo week starts Monday Aug 31,
+  // 2026 (matches the header). Real dates are needed to create real calendar
+  // events, so day names ("Mon", "Tue"...) are mapped onto that reference
+  // week here. Only APPROVED, assigned sessions get blocked -- an unfilled
+  // or un-approved session shouldn't claim time on anyone's real calendar.
+  const WEEK_START = "2026-08-31"; // Monday
+  const toISOWithOffset = (day, time) => {
+    const dayOffset = DAYS.indexOf(day);
+    const base = new Date(`${WEEK_START}T00:00:00+05:30`);
+    base.setDate(base.getDate() + dayOffset);
+    const [h, m] = time.split(":").map(Number);
+    base.setHours(h, m, 0, 0);
+    const pad = (n) => String(n).padStart(2, "0");
+    const off = "+05:30";
+    return `${base.getFullYear()}-${pad(base.getMonth() + 1)}-${pad(base.getDate())}T${pad(base.getHours())}:${pad(base.getMinutes())}:00${off}`;
+  };
+
+  const blockCalendar = async () => {
+    const approvedSessions = sessions.filter((s) => {
+      const smeId = finalAssignment(s.id);
+      return smeId && smeId !== "__DROPPED__" && approved[s.id];
+    });
+    if (approvedSessions.length === 0) {
+      setCalendarResults({ error: "No approved, assigned sessions to block -- approve at least one session first." });
+      return;
+    }
+    setCalendarStatus("blocking");
+    const events = approvedSessions.map((s) => {
+      const sme = smeById(finalAssignment(s.id));
+      const startTime = toISOWithOffset(s.day, s.start);
+      const endDate = new Date(startTime);
+      endDate.setMinutes(endDate.getMinutes() + s.dur);
+      const pad = (n) => String(n).padStart(2, "0");
+      const endTime = `${endDate.getFullYear()}-${pad(endDate.getMonth() + 1)}-${pad(endDate.getDate())}T${pad(endDate.getHours())}:${pad(endDate.getMinutes())}:00+05:30`;
+      return {
+        summary: `${s.topic} — ${sme.name}`,
+        description: `Auto-scheduled by the SME Scheduling Agent.\nSession: ${s.topic} (${LEVEL_LABEL[s.level]})\nCohort: ${s.cohort}\nAssigned SME: ${sme.name}`,
+        startTime, endTime,
+      };
+    });
+    try {
+      const response = await fetch("/api/calendar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ events }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setCalendarResults({ error: data.error || "Calendar blocking failed." });
+      } else {
+        setCalendarResults({ results: data.results });
+      }
+    } catch (e) {
+      setCalendarResults({ error: `Request failed: ${String(e)}` });
+    }
+    setCalendarStatus("done");
   };
 
   return (
@@ -1148,8 +1208,11 @@ export default function SchedulerApp() {
                   <button onClick={exportToSheet} style={{ ...mono, fontSize: 11.5, color: T.accent, background: "transparent", border: `1px solid ${T.accent}55`, borderRadius: 6, padding: "7px 12px", cursor: "pointer" }}>
                     ⬇ Export to Sheets (.csv)
                   </button>
-                  <button onClick={() => setPhase("submitted")} style={{ ...mono, fontSize: 11.5, fontWeight: 700, color: "#0E1013", background: T.green, border: "none", borderRadius: 6, padding: "7px 12px", cursor: "pointer" }}>
-                    Submit approvals →
+                  <button onClick={async () => {
+                    setPhase("submitted");
+                    await blockCalendar();
+                  }} disabled={calendarStatus === "blocking"} style={{ ...mono, fontSize: 11.5, fontWeight: 700, color: "#0E1013", background: T.green, border: "none", borderRadius: 6, padding: "7px 12px", cursor: "pointer", opacity: calendarStatus === "blocking" ? 0.7 : 1 }}>
+                    {calendarStatus === "blocking" ? "Submitting & blocking calendar…" : "Submit approvals →"}
                   </button>
                 </div>
               </div>
@@ -1245,7 +1308,31 @@ export default function SchedulerApp() {
           <div style={{ fontSize: 12.5, color: T.sub, marginBottom: 4 }}>
             {stats.approvedCount} of {stats.total} sessions approved · {stats.unfilled} still need ops follow-up.
           </div>
-          <div style={{ fontSize: 11.5, color: T.faint, ...mono, marginBottom: 20 }}>In production this write-back would push directly to the Google Sheet / Calendar via the FastAPI service — the CSV export below is that same read/write seam, standing in for a live Sheets API call in this synthetic-data prototype.</div>
+          <div style={{ fontSize: 11.5, color: T.faint, ...mono, marginBottom: 16 }}>The CSV export below is the Sheets read/write seam (see write-up). Approved sessions are also pushed live to your connected Google Calendar below.</div>
+
+          {calendarStatus === "blocking" && (
+            <div style={{ maxWidth: 480, margin: "0 auto 16px", padding: "10px 14px", background: `${T.accent}12`, border: `1px solid ${T.accent}40`, borderRadius: 6, fontSize: 12 }}>
+              📅 Blocking your calendar for approved sessions…
+            </div>
+          )}
+          {calendarStatus === "done" && calendarResults?.error && (
+            <div style={{ maxWidth: 480, margin: "0 auto 16px", padding: "10px 14px", background: `${T.red}15`, border: `1px solid ${T.red}45`, borderRadius: 6, fontSize: 12, textAlign: "left" }}>
+              ⚠ Calendar blocking failed: {calendarResults.error}
+            </div>
+          )}
+          {calendarStatus === "done" && calendarResults?.results && (
+            <div style={{ maxWidth: 480, margin: "0 auto 16px", padding: "10px 14px", background: T.panel, border: `1px solid ${T.line}`, borderRadius: 6, fontSize: 11.5, textAlign: "left" }}>
+              <div style={{ color: T.text, marginBottom: 6, fontWeight: 600 }}>
+                📅 Calendar: {calendarResults.results.filter((r) => r.success).length}/{calendarResults.results.length} events created
+              </div>
+              {calendarResults.results.map((r, i) => (
+                <div key={i} style={{ color: r.success ? T.green : T.red, ...mono, fontSize: 10.5, marginBottom: 2 }}>
+                  {r.success ? "✓" : "✗"} {r.summary}{r.error ? ` — ${r.error}` : ""}
+                </div>
+              ))}
+            </div>
+          )}
+
           <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
             <button onClick={exportToSheet} style={{ ...mono, fontSize: 11.5, color: T.accent, background: "transparent", border: `1px solid ${T.accent}55`, borderRadius: 6, padding: "7px 14px", cursor: "pointer" }}>
               ⬇ Export to Sheets (.csv)

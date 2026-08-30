@@ -426,7 +426,15 @@ function runMatchingEngine(sessions, smes, weights = DEFAULT_WEIGHTS) {
     const qualified = ranked.filter((r) => r.qualifies);
 
     if (qualified.length === 0) {
-      const allReasons = Array.from(new Set(ranked.flatMap((r) => r.reasons)));
+      // Reasons are collected across the whole pool, so a session can show
+      // several disqualification reasons at once. Most are usually the
+      // generic "no expertise in topic" from SMEs who were never plausible
+      // candidates to begin with — that shouldn't crowd out a more specific,
+      // actionable reason (like a cap or double-booking) from an SME who was
+      // otherwise a real contender. Rank by specificity, most useful first.
+      const REASON_PRIORITY = ["at weekly session cap", "double-booked this week", "below required level", "not available at this slot", "no expertise in topic"];
+      const reasonRank = (r) => { const i = REASON_PRIORITY.findIndex((p) => r.startsWith(p)); return i === -1 ? REASON_PRIORITY.length : i; };
+      const allReasons = Array.from(new Set(ranked.flatMap((r) => r.reasons))).sort((a, b) => reasonRank(a) - reasonRank(b));
       assignments.push({ sessionId: session.id, smeId: null, status: "unfilled" });
       flags.push({
         type: "unfilled",
@@ -732,6 +740,28 @@ export default function SchedulerApp() {
     return lvl !== undefined && lvl >= session.level && isAvailable(sme, session);
   });
 
+  // The override dropdown deliberately shows every hard-rule-qualified SME,
+  // even ones who'd exceed their cap or get double-booked if picked — a human
+  // may have a real reason to override those (e.g. the instructor agreed to
+  // take one extra session this week). But that override should be a
+  // conscious choice, not an accidental one, so we warn inline rather than
+  // silently allowing it.
+  const overrideWarning = (sme, session) => {
+    const currentCount = currentWeekCounts[sme.id] || 0;
+    const alreadyAtOrOverCap = currentCount >= sme.maxPerWeek && finalAssignment(session.id) !== sme.id;
+    const doubleBooked = sessions.some((other) => {
+      if (other.id === session.id) return false;
+      if (finalAssignment(other.id) !== sme.id) return false;
+      if (other.day !== session.day) return false;
+      const aStart = toMin(other.start), aEnd = aStart + other.dur;
+      const bStart = toMin(session.start), bEnd = bStart + session.dur;
+      return aStart < bEnd && bStart < aEnd;
+    });
+    if (doubleBooked) return "would double-book";
+    if (alreadyAtOrOverCap) return "exceeds cap";
+    return null;
+  };
+
   const simulateDropout = (sessionId) => {
     const smeId = finalAssignment(sessionId);
     if (!smeId) return;
@@ -992,9 +1022,14 @@ export default function SchedulerApp() {
                                   style={{ ...mono, fontSize: 11, background: T.panel2, color: T.text, border: `1px solid ${T.line}`, borderRadius: 5, padding: "3px 6px" }}
                                 >
                                   <option value="">— unassigned —</option>
-                                  {qualified.map((q) => (
-                                    <option key={q.id} value={q.id}>{q.name}{q.id === assignedId ? " (matched)" : ""}</option>
-                                  ))}
+                                  {qualified.map((q) => {
+                                    const warning = overrideWarning(q, s);
+                                    return (
+                                      <option key={q.id} value={q.id}>
+                                        {q.name}{q.id === assignedId ? " (matched)" : ""}{warning ? ` ⚠ ${warning}` : ""}
+                                      </option>
+                                    );
+                                  })}
                                 </select>
 
                                 {sme && (

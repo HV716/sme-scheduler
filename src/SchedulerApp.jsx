@@ -1089,6 +1089,18 @@ export default function SchedulerApp() {
                   {items.map((f, i) => {
                     const aiNote = f.type === "fairness" && f.smeId ? aiOut?.fairnessNotes?.find((n) => n.smeId === f.smeId) : null;
                     const clickable = !!f.sessionId;
+                    // Tie flags are created with a static "pending rationale" placeholder
+                    // before the AI call resolves. Swap in the real explanation once it's
+                    // back, so the right rail doesn't keep showing "pending" forever after
+                    // the answer already exists (it otherwise only appeared inline under
+                    // the session row itself).
+                    let displayReason = f.reason;
+                    if (f.type === "tie") {
+                      const tieAi = aiOut?.tieBreaks?.find((t) => t.sessionId === f.sessionId);
+                      const tie = engineOut.ties.find((t) => t.sessionId === f.sessionId);
+                      if (tieAi && tie) displayReason = `Close call between ${tie.a.name} and ${tie.b.name} — ${tieAi.explanation}`;
+                      else if (aiError && tie) displayReason = `Close call between ${tie.a.name} and ${tie.b.name} — AI rationale unavailable for this run.`;
+                    }
                     return (
                       <div
                         key={i}
@@ -1096,11 +1108,12 @@ export default function SchedulerApp() {
                         style={{
                           fontSize: 11.5, lineHeight: 1.5, padding: "8px 10px", background: T.panel2, borderRadius: 6, marginBottom: 6,
                           border: `1px solid ${tone}30`, cursor: clickable ? "pointer" : "default", transition: "border-color 0.15s",
+                          userSelect: clickable ? "none" : "auto", WebkitUserSelect: clickable ? "none" : "auto",
                         }}
                         onMouseEnter={(e) => { if (clickable) e.currentTarget.style.borderColor = tone; }}
                         onMouseLeave={(e) => { if (clickable) e.currentTarget.style.borderColor = `${tone}30`; }}
                       >
-                        <div style={{ color: T.text }}>{f.reason}</div>
+                        <div style={{ color: T.text }}>{displayReason}</div>
                         {aiNote && <div style={{ marginTop: 4, color: T.accent, fontSize: 11 }}>↳ {aiNote.note}</div>}
                         {f.sessionId && (
                           <div style={{ marginTop: 4, color: T.accent, ...mono, fontSize: 10, display: "flex", alignItems: "center", gap: 4 }}>

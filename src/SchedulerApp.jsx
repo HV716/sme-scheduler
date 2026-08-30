@@ -522,20 +522,26 @@ function runMatchingEngine(sessions, smes, weights = DEFAULT_WEIGHTS) {
    an ops-facing executive summary. Deterministic flags (unfilled,
    availability, cap) don't need the model — only judgment calls do.
    ============================================================ */
-async function getLLMReasoning({ ties, fairnessFlags, unfilledCount, totalSessions }) {
+async function getLLMReasoning({ ties, fairnessFlags, unfilledCount, totalSessions, expertiseGaps, poolTopics }) {
   const prompt = `You are assisting an ops team reviewing an auto-generated SME-to-session teaching schedule.
 Return ONLY minified JSON, no markdown, matching exactly this shape:
-{"tieBreaks":[{"sessionId":"","explanation":""}],"fairnessNotes":[{"smeId":"","note":""}],"summary":""}
+{"tieBreaks":[{"sessionId":"","explanation":""}],"fairnessNotes":[{"smeId":"","note":""}],"summary":"","expertiseSuggestions":[{"sessionId":"","matchedTopic":null,"confidence":"","rationale":""}]}
 
 Rules:
 - tieBreaks: one entry per tie below, a 1-sentence, ops-friendly explanation of why the FIRST candidate (a) is the marginally better pick over the second (b), referencing rating/fit, not raw scores.
 - fairnessNotes: one short, constructive sentence per fairness flag suggesting a rebalancing action for next week.
 - summary: 2 sentences, plain language, for a curriculum ops manager: overall fill rate and the single biggest risk in this draft.
+- expertiseSuggestions: one entry per session listed in ExpertiseGaps below. These sessions have NO SME whose skill list contains their exact topic string — but the mismatch might just be naming (e.g. "Cloud Fundamentals" vs "AWS Basics" could be the same real-world skill). For each session, compare its topic against the exact strings in PoolTopics (the topics that actually exist in the SME pool) and decide if any ONE of them plausibly refers to the same real-world subject.
+  - If yes: set "matchedTopic" to that EXACT string as it appears in PoolTopics (character-for-character, do not paraphrase it), "confidence" to "high" or "medium", and a one-sentence "rationale".
+  - If no plausible match exists (genuinely a different skill, not just different wording), set "matchedTopic" to null, "confidence" to "none", and rationale explaining briefly why nothing matches.
+  - Do not guess speculatively — only suggest a match if the topics are very likely the same underlying subject under different naming, not merely "related" or "adjacent" fields.
 
 Ties: ${JSON.stringify(ties)}
 FairnessFlags: ${JSON.stringify(fairnessFlags)}
 UnfilledCount: ${unfilledCount}
-TotalSessions: ${totalSessions}`;
+TotalSessions: ${totalSessions}
+ExpertiseGaps: ${JSON.stringify(expertiseGaps)}
+PoolTopics: ${JSON.stringify(poolTopics)}`;
 
   const response = await fetch("/api/reason", {
     method: "POST",
@@ -619,21 +625,34 @@ export default function SchedulerApp() {
   const avgPool = useMemo(() => poolAvg4(smes), [smes]);
 
   const runReasoning = useCallback(async (out) => {
+    // Sessions unfilled specifically because no SME has this exact topic
+    // string at all — these are the only candidates for semantic/naming
+    // matching. Sessions unfilled for availability/cap/level reasons don't
+    // need this: the topic already exists in the pool, it's a scheduling
+    // constraint, not a naming mismatch.
+    const expertiseGaps = out.flags
+      .filter((f) => f.type === "unfilled" && f.reason.toLowerCase().includes("no expertise"))
+      .map((f) => ({ sessionId: f.sessionId, topic: sessions.find((s) => s.id === f.sessionId)?.topic }))
+      .filter((g) => g.topic);
+    const poolTopics = Array.from(new Set(smes.flatMap((s) => Object.keys(s.skills))));
+
     try {
       const ai = await getLLMReasoning({
         ties: out.ties,
         fairnessFlags: out.fairnessFlags,
         unfilledCount: out.flags.filter((f) => f.type === "unfilled").length,
         totalSessions: sessions.length,
+        expertiseGaps,
+        poolTopics,
       });
       setAiOut(ai);
       setAiError(null);
     } catch (e) {
       setAiError("AI reasoning layer unavailable — showing rule-based flags only.");
-      setAiOut({ tieBreaks: [], fairnessNotes: [], summary: null });
+      setAiOut({ tieBreaks: [], fairnessNotes: [], summary: null, expertiseSuggestions: [] });
     }
     setAiStale(false);
-  }, [sessions]);
+  }, [sessions, smes]);
 
   const runAll = useCallback(async () => {
     setPhase("matching");
@@ -739,6 +758,20 @@ export default function SchedulerApp() {
     const lvl = sme.skills[session.topic];
     return lvl !== undefined && lvl >= session.level && isAvailable(sme, session);
   });
+
+  // A suggested match is never auto-assigned — it still has to pass every
+  // hard rule (level, availability) to even be offered, and ops must
+  // actively pick it from the dropdown. This keeps the LLM's role limited to
+  // "here's a plausible naming match," never "here's who's assigned."
+  const aiSuggestedCandidatesFor = (session) => {
+    const suggestion = aiOut?.expertiseSuggestions?.find((e) => e.sessionId === session.id && e.matchedTopic);
+    if (!suggestion) return { suggestion: null, candidates: [] };
+    const candidates = smes.filter((sme) => {
+      const lvl = sme.skills[suggestion.matchedTopic];
+      return lvl !== undefined && lvl >= session.level && isAvailable(sme, session);
+    });
+    return { suggestion, candidates };
+  };
 
   // The override dropdown deliberately shows every hard-rule-qualified SME,
   // even ones who'd exceed their cap or get double-booked if picked — a human
@@ -978,6 +1011,7 @@ export default function SchedulerApp() {
                         const tieAi = aiOut?.tieBreaks?.find((t) => t.sessionId === s.id);
                         const isApproved = approved[s.id];
                         const qualified = qualifiedFor(s);
+                        const { suggestion: aiSuggestion, candidates: aiCandidates } = aiSuggestedCandidatesFor(s);
                         const engAssignment = engineOut.assignments.find((a) => a.sessionId === s.id);
                         const confidence = overrides[s.id] === undefined ? engAssignment?.confidence : null;
                         const belowFloor = overrides[s.id] === undefined && engAssignment?.belowFloorFallback;
@@ -1030,6 +1064,18 @@ export default function SchedulerApp() {
                                       </option>
                                     );
                                   })}
+                                  {aiCandidates.length > 0 && (
+                                    <optgroup label={`🧭 AI-suggested (semantic match: "${aiSuggestion.matchedTopic}")`}>
+                                      {aiCandidates.map((q) => {
+                                        const warning = overrideWarning(q, s);
+                                        return (
+                                          <option key={`ai-${q.id}`} value={q.id}>
+                                            {q.name} — via "{aiSuggestion.matchedTopic}"{warning ? ` ⚠ ${warning}` : ""}
+                                          </option>
+                                        );
+                                      })}
+                                    </optgroup>
+                                  )}
                                 </select>
 
                                 {sme && (
@@ -1053,6 +1099,13 @@ export default function SchedulerApp() {
                               {tie && (
                                 <div style={{ marginTop: 4, fontSize: 11.5, color: T.purple, lineHeight: 1.4 }}>
                                   ⚖ {tieAi?.explanation || `Tie between ${tie.a.name} and ${tie.b.name} — awaiting AI rationale.`}
+                                </div>
+                              )}
+                              {aiSuggestion && (
+                                <div style={{ marginTop: 4, fontSize: 11.5, color: T.accent, lineHeight: 1.4 }}>
+                                  🧭 {aiCandidates.length > 0
+                                    ? `AI suggests "${aiSuggestion.matchedTopic}" may be the same skill as "${s.topic}" under different naming (${aiSuggestion.confidence} confidence) — ${aiCandidates.map((c) => c.name).join(", ")} would qualify. ${aiSuggestion.rationale} Select from the dropdown to confirm.`
+                                    : `AI suggests "${aiSuggestion.matchedTopic}" may be the same skill as "${s.topic}", but nobody with that skill is available/qualified for this slot either.`}
                                 </div>
                               )}
                             </div>

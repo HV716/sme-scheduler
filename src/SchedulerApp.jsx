@@ -426,15 +426,19 @@ function runMatchingEngine(sessions, smes, weights = DEFAULT_WEIGHTS) {
     const qualified = ranked.filter((r) => r.qualifies);
 
     if (qualified.length === 0) {
-      // Reasons are collected across the whole pool, so a session can show
-      // several disqualification reasons at once. Most are usually the
-      // generic "no expertise in topic" from SMEs who were never plausible
-      // candidates to begin with — that shouldn't crowd out a more specific,
-      // actionable reason (like a cap or double-booking) from an SME who was
-      // otherwise a real contender. Rank by specificity, most useful first.
-      const REASON_PRIORITY = ["at weekly session cap", "double-booked this week", "below required level", "not available at this slot", "no expertise in topic"];
+      // Reasons are collected across the whole pool, so a session can show a
+      // reason that's technically true but irrelevant — e.g. an SME with zero
+      // expertise in this topic happens to also be double-booked elsewhere,
+      // and that unrelated coincidence outranks the real story. Only
+      // candidates who actually have this topic in their skills are "near
+      // misses" worth explaining; everyone else just doesn't teach it.
+      const topicRelevant = ranked.filter((r) => r.sme.skills[session.topic] !== undefined);
+      const relevantReasons = Array.from(new Set(topicRelevant.flatMap((r) => r.reasons)));
+      const REASON_PRIORITY = ["at weekly session cap", "double-booked this week", "below required level", "not available at this slot"];
       const reasonRank = (r) => { const i = REASON_PRIORITY.findIndex((p) => r.startsWith(p)); return i === -1 ? REASON_PRIORITY.length : i; };
-      const allReasons = Array.from(new Set(ranked.flatMap((r) => r.reasons))).sort((a, b) => reasonRank(a) - reasonRank(b));
+      const allReasons = relevantReasons.length > 0
+        ? relevantReasons.sort((a, b) => reasonRank(a) - reasonRank(b))
+        : ["no expertise in topic"]; // truly nobody in the pool teaches this at all
       assignments.push({ sessionId: session.id, smeId: null, status: "unfilled" });
       flags.push({
         type: "unfilled",

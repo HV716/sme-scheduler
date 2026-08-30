@@ -267,7 +267,7 @@ function parseSMEsCSV(text) {
     const skills = parseSkillMap(row.skills);
     if (Object.keys(skills).length === 0) return { error: `Row ${i + 2} (${row.name || row.id}): "skills" column has no valid "Topic:Level" pairs.` };
     const history4raw = (row.history4 || "").split(",").map((x) => Number(x.trim()));
-    if (history4raw.length !== 4 || history4raw.some(isNaN)) return { error: `Row ${i + 2} (${row.name || row.id}): "history4" should be exactly 4 comma-separated numbers, e.g. "3,4,2,4".` };
+    if (history4raw.length !== 4 || history4raw.some(isNaN)) return { error: `Row ${i + 2} (${row.name || row.id}): "history4" should be exactly 4 comma-separated numbers, oldest to most recent week, e.g. "3,4,2,4" means 4 weeks ago=3, 3 weeks ago=4, 2 weeks ago=2, last week=4.` };
     if (isNaN(Number(row.maxPerWeek)) || Number(row.maxPerWeek) <= 0) return { error: `Row ${i + 2} (${row.name || row.id}): "maxPerWeek" should be a positive number.` };
     smes.push({
       id: row.id, name: row.name, tz,
@@ -350,12 +350,29 @@ function isAvailable(sme, session) {
 /* ============================================================
    MATCHING ENGINE — deterministic rules + scoring
    ============================================================ */
+// history4 convention: [4-weeks-ago, 3-weeks-ago, 2-weeks-ago, last-week] —
+// oldest to most recent, left to right (matches how it's displayed in the UI,
+// e.g. "3 → 4 → 2 → 4").
+//
+// A flat average of the 4 weeks would treat [8,8,0,0] (busy a month ago,
+// quiet the last two weeks) identically to [4,4,4,4] (steadily busy,
+// including right now) — both average to 4.0, even though the first person
+// is clearly less loaded *currently* than the second. Weighting recent weeks
+// more heavily (last week counts 4x as much as 4 weeks ago) fixes this:
+// [8,8,0,0] -> (8*1+8*2+0*3+0*4)/10 = 2.4, [4,4,4,4] -> 4.0 — now correctly
+// distinguishable, and the recently-quiet person is favored for the next
+// assignment even though their raw 4-week totals are identical.
+const RECENCY_WEIGHTS = [1, 2, 3, 4];
+const RECENCY_WEIGHT_SUM = RECENCY_WEIGHTS.reduce((a, b) => a + b, 0);
+const weightedRollingAvg = (history4) =>
+  history4.reduce((sum, count, i) => sum + count * RECENCY_WEIGHTS[i], 0) / RECENCY_WEIGHT_SUM;
+
 const poolAvg4 = (smes) =>
-  smes.reduce((sum, s) => sum + s.history4.reduce((a, b) => a + b, 0) / 4, 0) / smes.length;
+  smes.reduce((sum, s) => sum + weightedRollingAvg(s.history4), 0) / smes.length;
 
 function scoreCandidate(sme, session, thisWeekCount, avgPool, weights) {
   const rating = sme.ratings[session.topic] ?? 3.5; // historical performance
-  const rollingAvg = sme.history4.reduce((a, b) => a + b, 0) / 4;
+  const rollingAvg = weightedRollingAvg(sme.history4);
   const projected = rollingAvg === 0 ? thisWeekCount : (rollingAvg * 4 + thisWeekCount) / 5;
   // fairness: reward SMEs currently below the pool's rolling average
   const fairness = Math.max(0, avgPool - projected) * 2.2;
@@ -497,7 +514,7 @@ function runMatchingEngine(sessions, smes, weights = DEFAULT_WEIGHTS) {
   const fairnessFlags = [];
   for (const sme of smes) {
     const count = weekCounts[sme.id] || 0;
-    const rollingAvg = sme.history4.reduce((a, b) => a + b, 0) / 4;
+    const rollingAvg = weightedRollingAvg(sme.history4);
     if (count > rollingAvg * 1.6 + 1) {
       fairnessFlags.push({ smeId: sme.id, name: sme.name, count, rollingAvg: Number(rollingAvg.toFixed(1)) });
       flags.push({
@@ -917,7 +934,7 @@ export default function SchedulerApp() {
           </div>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 10 }}>
             <div style={{ fontSize: 10.5, color: T.faint, lineHeight: 1.5, maxWidth: 560 }}>
-              SME columns encode nested fields as <code>Topic:Level</code> or <code>Day:start-end</code> pairs separated by <code>|</code> — download a template to see a filled example before editing. Timezone must be one of: IST, EST, EDT, CST, CDT, PST, PDT, UTC, GMT, CET, CEST, SGT, AEST, AEDT, ACST, JST, KST, NZST, HST, AKST, MSK.
+              SME columns encode nested fields as <code>Topic:Level</code> or <code>Day:start-end</code> pairs separated by <code>|</code> — download a template to see a filled example before editing. <code>history4</code> is oldest→most-recent week left to right (e.g. "3,4,2,4" = 4 weeks ago, 3 weeks ago, 2 weeks ago, last week) — recent weeks count more toward fairness than older ones. Timezone must be one of: IST, EST, EDT, CST, CDT, PST, PDT, UTC, GMT, CET, CEST, SGT, AEST, AEDT, ACST, JST, KST, NZST, HST, AKST, MSK.
             </div>
             {(dataSource.sessions === "uploaded" || dataSource.smes === "uploaded") && (
               <button onClick={resetToSampleData} style={{ ...mono, fontSize: 10.5, color: T.amber, background: "transparent", border: `1px solid ${T.amber}55`, borderRadius: 5, padding: "5px 9px", cursor: "pointer", whiteSpace: "nowrap" }}>
@@ -1142,7 +1159,7 @@ export default function SchedulerApp() {
               <div style={{ padding: 16, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                 {smes.map((sme) => {
                   const count = currentWeekCounts[sme.id] || 0;
-                  const rollingAvg = sme.history4.reduce((a, b) => a + b, 0) / 4;
+                  const rollingAvg = weightedRollingAvg(sme.history4);
                   return (
                     <div key={sme.id} style={{ background: T.panel, border: `1px solid ${T.line}`, borderRadius: 7, padding: 12 }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>

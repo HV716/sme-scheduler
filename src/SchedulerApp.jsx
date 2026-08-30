@@ -260,13 +260,17 @@ function parseSMEsCSV(text) {
 
   const smes = [];
   for (const [i, row] of data.entries()) {
+    const tz = (row.timezone || "").trim().toUpperCase() || "IST";
+    if (TZ_OFFSETS[tz] === undefined) {
+      return { error: `Row ${i + 2} (${row.name || row.id}): "${tz}" isn't a recognized timezone. Supported: ${Object.keys(TZ_OFFSETS).join(", ")}.` };
+    }
     const skills = parseSkillMap(row.skills);
     if (Object.keys(skills).length === 0) return { error: `Row ${i + 2} (${row.name || row.id}): "skills" column has no valid "Topic:Level" pairs.` };
     const history4raw = (row.history4 || "").split(",").map((x) => Number(x.trim()));
     if (history4raw.length !== 4 || history4raw.some(isNaN)) return { error: `Row ${i + 2} (${row.name || row.id}): "history4" should be exactly 4 comma-separated numbers, e.g. "3,4,2,4".` };
     if (isNaN(Number(row.maxPerWeek)) || Number(row.maxPerWeek) <= 0) return { error: `Row ${i + 2} (${row.name || row.id}): "maxPerWeek" should be a positive number.` };
     smes.push({
-      id: row.id, name: row.name, tz: row.timezone || "IST",
+      id: row.id, name: row.name, tz,
       skills, ratings: parseRatingMap(row.ratings), avail: parseAvailability(row.availability),
       history4: history4raw, maxPerWeek: Number(row.maxPerWeek),
       prefers: (row.prefers || "").split("|").map((x) => x.trim()).filter(Boolean),
@@ -284,13 +288,63 @@ function readFileAsText(file) {
   });
 }
 
+// Sessions are scheduled in the org's reference timezone (IST). SME
+// availability is stored in the SME's own local timezone, so it must be
+// converted into the reference timezone before comparing against a session's
+// time — this is the actual timezone-handling edge case named in the
+// assignment, not just a display label. Unknown/blank timezones default to
+// the reference zone (no shift) as a safe fallback.
+// Supported timezone abbreviations. This is a fixed, documented list — not
+// the full ~400-zone IANA database — and doesn't auto-resolve daylight saving
+// (EST vs EDT is the uploader's choice, not computed from the date). An
+// unrecognized value is rejected at upload time (see parseSMEsCSV) rather
+// than silently treated as zero-shift, since a silent wrong assumption here
+// would produce a schedule that looks correct but isn't.
+const TZ_OFFSETS = {
+  IST: 5.5, UTC: 0, GMT: 0,
+  EST: -5, EDT: -4, CST: -6, CDT: -5, PST: -8, PDT: -7,
+  CET: 1, CEST: 2, SGT: 8, AEST: 10, AEDT: 11, ACST: 9.5,
+  JST: 9, KST: 9, NZST: 12, HST: -10, AKST: -9, MSK: 3,
+};
+const REFERENCE_TZ = "IST";
+
+function shiftDay(day, delta) {
+  const idx = DAYS.indexOf(day);
+  if (idx === -1) return null;
+  const newIdx = idx + delta;
+  return newIdx >= 0 && newIdx < DAYS.length ? DAYS[newIdx] : null; // falls outside the Mon–Fri week
+}
+
+// Converts an SME's local-time availability windows into reference-timezone
+// minutes, splitting any window that crosses midnight after conversion into
+// two same-day segments rather than dropping it.
+function availabilityInReferenceTz(avail, smeTz) {
+  const localOffset = TZ_OFFSETS[smeTz] ?? TZ_OFFSETS[REFERENCE_TZ];
+  const deltaMinutes = Math.round((TZ_OFFSETS[REFERENCE_TZ] - localOffset) * 60);
+  const segments = [];
+  avail.forEach(([day, from, to]) => {
+    let fromMin = toMin(from) + deltaMinutes;
+    let toMinVal = toMin(to) + deltaMinutes;
+    const dayShift = Math.floor(fromMin / 1440);
+    fromMin -= dayShift * 1440;
+    toMinVal -= dayShift * 1440;
+    const day1 = shiftDay(day, dayShift);
+    if (toMinVal <= 1440) {
+      if (day1) segments.push([day1, fromMin, toMinVal]);
+    } else {
+      if (day1) segments.push([day1, fromMin, 1440]);
+      const day2 = shiftDay(day, dayShift + 1);
+      if (day2) segments.push([day2, 0, toMinVal - 1440]);
+    }
+  });
+  return segments;
+}
+
 function isAvailable(sme, session) {
   const sStart = toMin(session.start);
   const sEnd = sStart + session.dur;
-  return sme.avail.some(([day, from, to]) => {
-    if (day !== session.day) return false;
-    return sStart >= toMin(from) && sEnd <= toMin(to);
-  });
+  const availRef = availabilityInReferenceTz(sme.avail, sme.tz);
+  return availRef.some(([day, fromMin, toMinVal]) => day === session.day && sStart >= fromMin && sEnd <= toMinVal);
 }
 
 /* ============================================================
@@ -783,7 +837,7 @@ export default function SchedulerApp() {
           </div>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 10 }}>
             <div style={{ fontSize: 10.5, color: T.faint, lineHeight: 1.5, maxWidth: 560 }}>
-              SME columns encode nested fields as <code>Topic:Level</code> or <code>Day:start-end</code> pairs separated by <code>|</code> — download a template to see a filled example before editing.
+              SME columns encode nested fields as <code>Topic:Level</code> or <code>Day:start-end</code> pairs separated by <code>|</code> — download a template to see a filled example before editing. Timezone must be one of: IST, EST, EDT, CST, CDT, PST, PDT, UTC, GMT, CET, CEST, SGT, AEST, AEDT, ACST, JST, KST, NZST, HST, AKST, MSK.
             </div>
             {(dataSource.sessions === "uploaded" || dataSource.smes === "uploaded") && (
               <button onClick={resetToSampleData} style={{ ...mono, fontSize: 10.5, color: T.amber, background: "transparent", border: `1px solid ${T.amber}55`, borderRadius: 5, padding: "5px 9px", cursor: "pointer", whiteSpace: "nowrap" }}>

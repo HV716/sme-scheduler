@@ -589,6 +589,19 @@ export default function SchedulerApp() {
   const [overrides, setOverrides] = useState({}); // sessionId -> smeId
   const [approved, setApproved] = useState({}); // sessionId -> bool
   const [tab, setTab] = useState("schedule");
+  const [highlightedSession, setHighlightedSession] = useState(null);
+
+  const jumpToSession = (sessionId) => {
+    if (!sessionId) return;
+    setTab("schedule");
+    setHighlightedSession(sessionId);
+    // wait a tick for the schedule tab to render (in case we were on SME Pool)
+    setTimeout(() => {
+      const el = document.getElementById(`session-${sessionId}`);
+      if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 50);
+    setTimeout(() => setHighlightedSession(null), 2200);
+  };
   const [aiError, setAiError] = useState(null);
   const [droppedNote, setDroppedNote] = useState(null);
   const [weights, setWeights] = useState(DEFAULT_WEIGHTS);
@@ -940,9 +953,11 @@ export default function SchedulerApp() {
                         const belowFloor = overrides[s.id] === undefined && engAssignment?.belowFloorFallback;
 
                         return (
-                          <div key={s.id} style={{
+                          <div key={s.id} id={`session-${s.id}`} style={{
                             display: "flex", alignItems: "flex-start", gap: 12, padding: "10px 12px", marginBottom: 6,
-                            background: T.panel, border: `1px solid ${dropped || (flag?.type === "unfilled") ? T.red + "50" : T.line}`, borderRadius: 7,
+                            background: highlightedSession === s.id ? `${T.accent}18` : T.panel,
+                            border: `1px solid ${highlightedSession === s.id ? T.accent : dropped || (flag?.type === "unfilled") ? T.red + "50" : T.line}`,
+                            borderRadius: 7, transition: "background 0.3s, border-color 0.3s",
                           }}>
                             <div style={{ width: 92, ...mono, fontSize: 11.5, color: T.sub, paddingTop: 2 }}>{s.start} · {s.dur}m</div>
                             <div style={{ flex: 1 }}>
@@ -1073,11 +1088,25 @@ export default function SchedulerApp() {
                   <div style={{ fontSize: 10.5, ...mono, color: tone, marginBottom: 6, textTransform: "uppercase" }}>{sev} priority</div>
                   {items.map((f, i) => {
                     const aiNote = f.type === "fairness" && f.smeId ? aiOut?.fairnessNotes?.find((n) => n.smeId === f.smeId) : null;
+                    const clickable = !!f.sessionId;
                     return (
-                      <div key={i} style={{ fontSize: 11.5, lineHeight: 1.5, padding: "8px 10px", background: T.panel2, borderRadius: 6, marginBottom: 6, border: `1px solid ${tone}30` }}>
+                      <div
+                        key={i}
+                        onClick={clickable ? () => jumpToSession(f.sessionId) : undefined}
+                        style={{
+                          fontSize: 11.5, lineHeight: 1.5, padding: "8px 10px", background: T.panel2, borderRadius: 6, marginBottom: 6,
+                          border: `1px solid ${tone}30`, cursor: clickable ? "pointer" : "default", transition: "border-color 0.15s",
+                        }}
+                        onMouseEnter={(e) => { if (clickable) e.currentTarget.style.borderColor = tone; }}
+                        onMouseLeave={(e) => { if (clickable) e.currentTarget.style.borderColor = `${tone}30`; }}
+                      >
                         <div style={{ color: T.text }}>{f.reason}</div>
                         {aiNote && <div style={{ marginTop: 4, color: T.accent, fontSize: 11 }}>↳ {aiNote.note}</div>}
-                        {f.sessionId && <div style={{ marginTop: 4, color: T.faint, ...mono, fontSize: 10 }}>{f.sessionId}</div>}
+                        {f.sessionId && (
+                          <div style={{ marginTop: 4, color: T.accent, ...mono, fontSize: 10, display: "flex", alignItems: "center", gap: 4 }}>
+                            → jump to {f.sessionId}
+                          </div>
+                        )}
                       </div>
                     );
                   })}
